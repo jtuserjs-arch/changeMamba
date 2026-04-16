@@ -10,7 +10,6 @@ from changedetection.tasks import get_trainer
 
 
 def main():
-  
     parser = argparse.ArgumentParser(description="Training on SYSU/LEVIR-CD+/WHU-CD dataset")
     parser.add_argument("--cfg", type=str, default=None)
     parser.add_argument("--opts", help="Modify config options by adding 'KEY VALUE' pairs.", default=None, nargs="+")
@@ -35,11 +34,6 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=5e-3)
-    parser.add_argument('--gate_mode', type=str, default='pixel', 
-                    choices=['none', 'image', 'pixel'],
-                    help='Dynamic gate mode (none, image, pixel)')
-    parser.add_argument('--use_uncertainty', action='store_true',
-                    help='Enable uncertainty estimation head')
 
     args = parser.parse_args()
     populate_name_lists(
