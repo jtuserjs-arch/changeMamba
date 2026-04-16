@@ -26,11 +26,6 @@ class ChangeMambaBCD(nn.Module):
         )
         self.main_clf = build_head(out_channels=2)
         self.use_uncertainty = use_uncertainty
-           # 如果启用不确定性，则分类头加入 Dropout
-        if use_uncertainty:
-            self.main_clf = build_head(out_channels=2, dropout_rate=dropout_rate)
-        else:
-            self.main_clf = build_head(out_channels=2)
 
     def forward(self, pre_data, post_data):
         pre_features = self.encoder(pre_data)
