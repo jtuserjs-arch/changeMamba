@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .model_utils import ResBlock
 from .vmamba import Permute, VSSBlock
 
+
 def make_processing_block(
     *,
     channel_first,
@@ -17,8 +18,15 @@ def make_processing_block(
     **kwargs,
 ):
     layers = []
+
     if in_channels is not None:
-        layers.append(nn.Conv2d(kernel_size=1, in_channels=in_channels, out_channels=hidden_dim))
+        layers.append(
+            nn.Conv2d(
+                kernel_size=1,
+                in_channels=in_channels,
+                out_channels=hidden_dim,
+            )
+        )
 
     if use_vss:
         layers.extend(
@@ -57,134 +65,299 @@ def make_processing_block(
 
     return nn.Sequential(*layers)
 
-# 在 import 部分之后，类定义之前添加
+
 class DynamicGating(nn.Module):
-    """动态门控模块，自适应融合三种时空建模输出"""
-    def __init__(self, hidden_dim, mode='pixel'):
+    """
+    Dynamic gate for fusing three spatio-temporal modeling branches.
+
+    mode:
+        - "pixel": produce [B, 3, H, W]
+        - "image": produce [B, 3, 1, 1]
+        - "none": average three branches
+    """
+
+    def __init__(self, hidden_dim=128, mode="pixel", reduction=4):
         super().__init__()
+
         self.mode = mode
-        if mode == 'image':
+        gate_hidden = max(hidden_dim // reduction, 16)
+
+        if mode == "pixel":
+            self.gate_net = nn.Sequential(
+                nn.Conv2d(
+                    in_channels=hidden_dim * 3,
+                    out_channels=gate_hidden,
+                    kernel_size=1,
+                    bias=False,
+                ),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(
+                    in_channels=gate_hidden,
+                    out_channels=3,
+                    kernel_size=1,
+                ),
+            )
+
+        elif mode == "image":
             self.gate_net = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(hidden_dim * 3, 64),
+                nn.Conv2d(
+                    in_channels=hidden_dim * 3,
+                    out_channels=gate_hidden,
+                    kernel_size=1,
+                    bias=False,
+                ),
                 nn.ReLU(inplace=True),
-                nn.Linear(64, 3)
+                nn.Conv2d(
+                    in_channels=gate_hidden,
+                    out_channels=3,
+                    kernel_size=1,
+                ),
             )
-        else:  # pixel
-            self.gate_net = nn.Conv2d(hidden_dim * 3, 3, kernel_size=1)
-    
+
+        elif mode == "none":
+            self.gate_net = None
+
+        else:
+            raise ValueError(
+                f"Unsupported gate mode: {mode}. "
+                f"Expected one of ['none', 'image', 'pixel']."
+            )
+
     def forward(self, out_seq, out_cross, out_par):
+        if self.mode == "none":
+            fused = (out_seq + out_cross + out_par) / 3.0
+            gate = torch.ones(
+                out_seq.shape[0],
+                3,
+                out_seq.shape[2],
+                out_seq.shape[3],
+                device=out_seq.device,
+                dtype=out_seq.dtype,
+            ) / 3.0
+            return fused, gate
+
         cat_feat = torch.cat([out_seq, out_cross, out_par], dim=1)
-        gate = self.gate_net(cat_feat)
-        gate = F.softmax(gate, dim=1)
-        if self.mode == 'image':
-            gate = gate.view(-1, 3, 1, 1)
-        fused = gate[:,0:1]*out_seq + gate[:,1:2]*out_cross + gate[:,2:3]*out_par
+        gate_logits = self.gate_net(cat_feat)
+        gate = F.softmax(gate_logits, dim=1)
+
+        fused = (
+            gate[:, 0:1] * out_seq
+            + gate[:, 1:2] * out_cross
+            + gate[:, 2:3] * out_par
+        )
+
         return fused, gate
+
+
 class DynamicChangeDecoder(nn.Module):
-    """动态门控 + 不确定性估计的变化解码器"""
-    def __init__(self, encoder_dims, channel_first, norm_layer, ssm_act_layer, mlp_act_layer,
-                 hidden_dim=128, gate_mode='pixel', use_uncertainty=True, **kwargs):
+    """
+    Dynamic STSS decoder.
+
+    Three branches:
+        1. seq branch: concat pre/post features
+        2. cross branch: interleave pre/post features along width
+        3. par branch: split pre/post features along width
+
+    Output:
+        change_feat: [B, 128, H, W]
+        gate_weights: last-stage gate map, [B, 3, h, w] or [B, 3, 1, 1]
+    """
+
+    def __init__(
+        self,
+        *,
+        encoder_dims,
+        channel_first,
+        norm_layer,
+        ssm_act_layer,
+        mlp_act_layer,
+        hidden_dim=128,
+        gate_mode="pixel",
+        **kwargs,
+    ):
         super().__init__()
+
         stage_dims = list(reversed(encoder_dims))
+
+        self.hidden_dim = hidden_dim
         self.gate_mode = gate_mode
-        self.use_uncertainty = use_uncertainty
-        
-        # 为每个 stage 创建三个分支：顺序(seq)、交叉(cross)、并行(par)
+
         self.seq_blocks = nn.ModuleList()
         self.cross_blocks = nn.ModuleList()
         self.par_blocks = nn.ModuleList()
         self.gate_modules = nn.ModuleList()
-        
-        for stage_idx, stage_dim in enumerate(stage_dims):
-            # 顺序分支：使用原始的 cat 模式（双时相拼接）
-            seq_block = make_processing_block(
-                channel_first=channel_first, norm_layer=norm_layer,
-                ssm_act_layer=ssm_act_layer, mlp_act_layer=mlp_act_layer,
-                hidden_dim=hidden_dim, in_channels=stage_dim*2, use_vss=True, **kwargs)
-            # 交叉分支：使用 interleave 模式
-            cross_block = make_processing_block(
-                channel_first=channel_first, norm_layer=norm_layer,
-                ssm_act_layer=ssm_act_layer, mlp_act_layer=mlp_act_layer,
-                hidden_dim=hidden_dim, in_channels=stage_dim, use_vss=True, **kwargs)
-            # 并行分支：使用 split 模式
-            par_block = make_processing_block(
-                channel_first=channel_first, norm_layer=norm_layer,
-                ssm_act_layer=ssm_act_layer, mlp_act_layer=mlp_act_layer,
-                hidden_dim=hidden_dim, in_channels=stage_dim, use_vss=True, **kwargs)
-            self.seq_blocks.append(seq_block)
-            self.cross_blocks.append(cross_block)
-            self.par_blocks.append(par_block)
-            self.gate_modules.append(DynamicGating(hidden_dim, mode=gate_mode))
-        
-        # 融合后的平滑层和上采样
-        self.fuse_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
-                nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True)
-            ) for _ in range(len(stage_dims))
-        ])
-        self.smooth_layers = nn.ModuleList([
-            ResBlock(hidden_dim, hidden_dim, stride=1) for _ in range(len(stage_dims)-1)
-        ])
-        
-        # 不确定性头（可选）
-        if use_uncertainty:
-            self.uncertainty_head = nn.Sequential(
-                nn.Conv2d(hidden_dim, 2, kernel_size=1),
-                nn.Softplus()  # 输出证据
+        self.fuse_layers = nn.ModuleList()
+
+        for stage_dim in stage_dims:
+            self.seq_blocks.append(
+                make_processing_block(
+                    channel_first=channel_first,
+                    norm_layer=norm_layer,
+                    ssm_act_layer=ssm_act_layer,
+                    mlp_act_layer=mlp_act_layer,
+                    hidden_dim=hidden_dim,
+                    in_channels=stage_dim * 2,
+                    use_vss=True,
+                    **kwargs,
+                )
             )
-    
-    def _interleave(self, pre, post):
-        B,C,H,W = pre.shape
-        out = pre.new_empty(B, C, H, 2*W)
-        out[:,:,:,::2] = pre
-        out[:,:,:,1::2] = post
-        return out
-    
-    def _split(self, pre, post):
-        B,C,H,W = pre.shape
-        out = pre.new_empty(B, C, H, 2*W)
-        out[:,:,:,:W] = pre
-        out[:,:,:,W:] = post
-        return out
-    
+
+            self.cross_blocks.append(
+                make_processing_block(
+                    channel_first=channel_first,
+                    norm_layer=norm_layer,
+                    ssm_act_layer=ssm_act_layer,
+                    mlp_act_layer=mlp_act_layer,
+                    hidden_dim=hidden_dim,
+                    in_channels=stage_dim,
+                    use_vss=True,
+                    **kwargs,
+                )
+            )
+
+            self.par_blocks.append(
+                make_processing_block(
+                    channel_first=channel_first,
+                    norm_layer=norm_layer,
+                    ssm_act_layer=ssm_act_layer,
+                    mlp_act_layer=mlp_act_layer,
+                    hidden_dim=hidden_dim,
+                    in_channels=stage_dim,
+                    use_vss=True,
+                    **kwargs,
+                )
+            )
+
+            self.gate_modules.append(
+                DynamicGating(
+                    hidden_dim=hidden_dim,
+                    mode=gate_mode,
+                )
+            )
+
+            self.fuse_layers.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels=hidden_dim,
+                        out_channels=hidden_dim,
+                        kernel_size=1,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                )
+            )
+
+        self.smooth_layers = nn.ModuleList(
+            [
+                ResBlock(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    stride=1,
+                )
+                for _ in range(len(stage_dims) - 1)
+            ]
+        )
+
+        self.latest_gate_weights = []
+
+    def _upsample_add(self, x, y):
+        return (
+            F.interpolate(
+                x,
+                size=y.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            + y
+        )
+
+    def _interleave(self, pre_feat, post_feat):
+        batch_size, channels, height, width = pre_feat.shape
+
+        tensor = pre_feat.new_empty(
+            batch_size,
+            channels,
+            height,
+            2 * width,
+        )
+
+        tensor[:, :, :, ::2] = pre_feat
+        tensor[:, :, :, 1::2] = post_feat
+
+        return tensor
+
+    def _split(self, pre_feat, post_feat):
+        batch_size, channels, height, width = pre_feat.shape
+
+        tensor = pre_feat.new_empty(
+            batch_size,
+            channels,
+            height,
+            2 * width,
+        )
+
+        tensor[:, :, :, :width] = pre_feat
+        tensor[:, :, :, width:] = post_feat
+
+        return tensor
+
     def forward(self, pre_features, post_features):
         previous = None
-        pre_rev = list(reversed(pre_features))
-        post_rev = list(reversed(post_features))
+        last_gate_weights = None
+        self.latest_gate_weights = []
 
-        for i, (pre_feat, post_feat) in enumerate(zip(pre_rev, post_rev)):
-            # 三个分支
-            out_seq = self.seq_blocks[i](torch.cat([pre_feat, post_feat], dim=1))
-            out_cross = self.cross_blocks[i](self._interleave(pre_feat, post_feat))
-            out_cross = out_cross[:, :, :, ::2] + out_cross[:, :, :, 1::2]
-            out_par = self.par_blocks[i](self._split(pre_feat, post_feat))
-            out_par = out_par[:, :, :, :pre_feat.shape[-1]] + out_par[:, :, :, pre_feat.shape[-1]:]
+        pre_stages = list(reversed(pre_features))
+        post_stages = list(reversed(post_features))
 
-            # 动态门控融合
-            fused, gate_weights = self.gate_modules[i](out_seq, out_cross, out_par)
-            fused = self.fuse_layers[i](fused)
+        for stage_idx, (pre_feat, post_feat) in enumerate(
+            zip(pre_stages, post_stages)
+        ):
+            width = pre_feat.shape[-1]
+
+            # 1. sequential / concat branch
+            out_seq = self.seq_blocks[stage_idx](
+                torch.cat([pre_feat, post_feat], dim=1)
+            )
+
+            # 2. cross / interleave branch
+            mixed_cross = self.cross_blocks[stage_idx](
+                self._interleave(pre_feat, post_feat)
+            )
+            out_cross = (
+                mixed_cross[:, :, :, ::2]
+                + mixed_cross[:, :, :, 1::2]
+            )
+
+            # 3. parallel / split branch
+            mixed_par = self.par_blocks[stage_idx](
+                self._split(pre_feat, post_feat)
+            )
+            out_par = (
+                mixed_par[:, :, :, :width]
+                + mixed_par[:, :, :, width:]
+            )
+
+            current, gate_weights = self.gate_modules[stage_idx](
+                out_seq,
+                out_cross,
+                out_par,
+            )
+
+            current = self.fuse_layers[stage_idx](current)
+
+            self.latest_gate_weights.append(gate_weights.detach())
+            last_gate_weights = gate_weights
 
             if previous is not None:
-                fused = self._upsample_add(previous, fused)
-                fused = self.smooth_layers[i-1](fused)
-            previous = fused
+                current = self._upsample_add(previous, current)
+                current = self.smooth_layers[stage_idx - 1](current)
 
-        # 最终特征图
-        change_feat = previous
+            previous = current
 
-        if self.use_uncertainty:
-            evidence = self.uncertainty_head(change_feat)   # [B,2,H,W]
-            alpha = evidence + 1
-            uncertainty = 2 / (alpha.sum(dim=1, keepdim=True))  # [B,1,H,W]
-            return change_feat, uncertainty, gate_weights
-        else:
-            return change_feat, None, gate_weights
-    
-    def _upsample_add(self, x, y):
-        return F.interpolate(x, size=y.shape[-2:], mode='bilinear') + y
+        return previous, last_gate_weights
+
 
 class HierarchicalChangeDecoder(nn.Module):
     _MODE_CHUNKS = {
@@ -207,19 +380,35 @@ class HierarchicalChangeDecoder(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.fusion_modes_by_stage = [tuple(modes) for modes in fusion_modes_by_stage]
+
+        self.fusion_modes_by_stage = [
+            tuple(modes) for modes in fusion_modes_by_stage
+        ]
+
         stage_dims = list(reversed(encoder_dims))
 
         self.stage_blocks = nn.ModuleList()
         self.fuse_layers = nn.ModuleList()
+
         self.smooth_layers = nn.ModuleList(
-            [ResBlock(in_channels=hidden_dim, out_channels=hidden_dim, stride=1) for _ in range(len(stage_dims) - 1)]
+            [
+                ResBlock(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    stride=1,
+                )
+                for _ in range(len(stage_dims) - 1)
+            ]
         )
 
-        for stage_idx, (stage_dim, fusion_modes) in enumerate(zip(stage_dims, self.fusion_modes_by_stage)):
+        for stage_idx, (stage_dim, fusion_modes) in enumerate(
+            zip(stage_dims, self.fusion_modes_by_stage)
+        ):
             stage_block = nn.ModuleDict()
+
             for mode in fusion_modes:
                 in_channels = stage_dim * 2 if mode == "cat" else stage_dim
+
                 stage_block[mode] = make_processing_block(
                     channel_first=channel_first,
                     norm_layer=norm_layer,
@@ -230,50 +419,99 @@ class HierarchicalChangeDecoder(nn.Module):
                     use_vss=use_vss_by_stage[stage_idx],
                     **kwargs,
                 )
+
             self.stage_blocks.append(stage_block)
 
-            input_chunks = sum(self._MODE_CHUNKS[mode] for mode in fusion_modes)
+            input_chunks = sum(
+                self._MODE_CHUNKS[mode] for mode in fusion_modes
+            )
+
             self.fuse_layers.append(
                 nn.Sequential(
-                    nn.Conv2d(kernel_size=1, in_channels=hidden_dim * input_chunks, out_channels=hidden_dim),
+                    nn.Conv2d(
+                        kernel_size=1,
+                        in_channels=hidden_dim * input_chunks,
+                        out_channels=hidden_dim,
+                    ),
                     nn.BatchNorm2d(hidden_dim),
                     nn.ReLU(inplace=True),
                 )
             )
 
     def _upsample_add(self, x, y):
-        return F.interpolate(x, size=y.shape[-2:], mode="bilinear") + y
+        return F.interpolate(
+            x,
+            size=y.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ) + y
 
     def _interleave(self, pre_feat, post_feat):
         batch_size, channels, height, width = pre_feat.shape
-        tensor = pre_feat.new_empty(batch_size, channels, height, 2 * width)
+
+        tensor = pre_feat.new_empty(
+            batch_size,
+            channels,
+            height,
+            2 * width,
+        )
+
         tensor[:, :, :, ::2] = pre_feat
         tensor[:, :, :, 1::2] = post_feat
+
         return tensor
 
     def _split(self, pre_feat, post_feat):
         batch_size, channels, height, width = pre_feat.shape
-        tensor = pre_feat.new_empty(batch_size, channels, height, 2 * width)
+
+        tensor = pre_feat.new_empty(
+            batch_size,
+            channels,
+            height,
+            2 * width,
+        )
+
         tensor[:, :, :, :width] = pre_feat
         tensor[:, :, :, width:] = post_feat
+
         return tensor
 
     def _collect_fusion_features(self, mode, block, pre_feat, post_feat):
         if mode == "cat":
-            return [block(torch.cat([pre_feat, post_feat], dim=1))]
+            return [
+                block(
+                    torch.cat(
+                        [pre_feat, post_feat],
+                        dim=1,
+                    )
+                )
+            ]
+
         if mode == "interleave":
             mixed = block(self._interleave(pre_feat, post_feat))
-            return [mixed[:, :, :, ::2], mixed[:, :, :, 1::2]]
+            return [
+                mixed[:, :, :, ::2],
+                mixed[:, :, :, 1::2],
+            ]
+
         if mode == "split":
             mixed = block(self._split(pre_feat, post_feat))
             width = pre_feat.shape[-1]
-            return [mixed[:, :, :, :width], mixed[:, :, :, width:]]
+            return [
+                mixed[:, :, :, :width],
+                mixed[:, :, :, width:],
+            ]
+
         raise ValueError(f"Unsupported fusion mode: {mode}")
 
     def forward(self, pre_features, post_features):
         previous = None
-        for stage_idx, (pre_feat, post_feat) in enumerate(zip(reversed(pre_features), reversed(post_features))):
+
+        for stage_idx, (pre_feat, post_feat) in enumerate(
+            zip(reversed(pre_features), reversed(post_features))
+        ):
             collected = []
+
             for mode in self.fusion_modes_by_stage[stage_idx]:
                 collected.extend(
                     self._collect_fusion_features(
@@ -284,10 +522,17 @@ class HierarchicalChangeDecoder(nn.Module):
                     )
                 )
 
-            current = self.fuse_layers[stage_idx](torch.cat(collected, dim=1))
+            current = self.fuse_layers[stage_idx](
+                torch.cat(collected, dim=1)
+            )
+
             if previous is not None:
-                current = self.smooth_layers[stage_idx - 1](self._upsample_add(previous, current))
+                current = self.smooth_layers[stage_idx - 1](
+                    self._upsample_add(previous, current)
+                )
+
             previous = current
+
         return previous
 
 
@@ -304,6 +549,7 @@ class HierarchicalSemanticDecoder(nn.Module):
         **kwargs,
     ):
         super().__init__()
+
         stage_dims = list(reversed(encoder_dims))
 
         self.stage_blocks = nn.ModuleList(
@@ -319,6 +565,7 @@ class HierarchicalSemanticDecoder(nn.Module):
                 )
             ]
         )
+
         self.stage_blocks.extend(
             [
                 make_processing_block(
@@ -336,26 +583,47 @@ class HierarchicalSemanticDecoder(nn.Module):
         self.transition_layers = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Conv2d(kernel_size=1, in_channels=stage_dim, out_channels=hidden_dim),
+                    nn.Conv2d(
+                        kernel_size=1,
+                        in_channels=stage_dim,
+                        out_channels=hidden_dim,
+                    ),
                     nn.BatchNorm2d(hidden_dim),
                     nn.ReLU(inplace=True),
                 )
                 for stage_dim in stage_dims[1:]
             ]
         )
+
         self.smooth_layers = nn.ModuleList(
-            [ResBlock(in_channels=hidden_dim, out_channels=hidden_dim, stride=1) for _ in range(len(stage_dims))]
+            [
+                ResBlock(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    stride=1,
+                )
+                for _ in range(len(stage_dims))
+            ]
         )
 
     def _upsample_add(self, x, y):
-        return F.interpolate(x, size=y.shape[-2:], mode="bilinear") + y
+        return F.interpolate(
+            x,
+            size=y.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ) + y
 
     def forward(self, features):
         stages = list(reversed(features))
+
         current = self.stage_blocks[0](stages[0])
 
         for stage_idx, stage_feat in enumerate(stages[1:], start=1):
-            current = self._upsample_add(current, self.transition_layers[stage_idx - 1](stage_feat))
+            current = self._upsample_add(
+                current,
+                self.transition_layers[stage_idx - 1](stage_feat),
+            )
             current = self.smooth_layers[stage_idx - 1](current)
             current = self.stage_blocks[stage_idx](current)
 
