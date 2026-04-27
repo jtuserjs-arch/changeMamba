@@ -54,7 +54,12 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--use_uncertainty', action='store_true',
                         help='Enable uncertainty estimation head')
-    
+    parser.add_argument(
+    "--uncertainty_weight",
+    type=float,
+    default=0.01,
+    help="Weight of evidential uncertainty loss"
+    )
     parser.add_argument("--eval_interval", type=int, default=500, help="Evaluate every N iterations")
     args = parser.parse_args()
 
