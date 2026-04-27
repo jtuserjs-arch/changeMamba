@@ -21,9 +21,13 @@ def resolve_decoder_components(kwargs):
     return norm_layer, ssm_act_layer, mlp_act_layer, clean_kwargs
 
 
-def build_head(out_channels, in_channels=128):
-    return nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
-
-
+def build_head(out_channels, in_channels=128, dropout_rate=0.0):
+    if dropout_rate > 0:
+        return nn.Sequential(
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        )
+    else:
+        return nn.Conv2d(in_channels, out_channels, kernel_size=1)
 def resize_to_input(logits, reference):
     return F.interpolate(logits, size=reference.shape[-2:], mode="bilinear")

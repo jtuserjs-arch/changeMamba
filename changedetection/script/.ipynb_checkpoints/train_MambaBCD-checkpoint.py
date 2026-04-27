@@ -1,5 +1,8 @@
 import sys
 import os
+import random
+import numpy as np
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -7,6 +10,16 @@ import argparse
 
 from changedetection.script.script_utils import populate_name_lists
 from changedetection.tasks import get_trainer
+
+
+def set_seed(seed):
+    """固定所有随机种子，保证可重复性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def main():
@@ -34,8 +47,21 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=5e-3)
-
+    parser.add_argument('--gate_mode', type=str, default='pixel',
+                        choices=['none', 'image', 'pixel'],
+                        help='Dynamic gate mode (none, image, pixel)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility')
+    parser.add_argument('--use_uncertainty', action='store_true',
+                        help='Enable uncertainty estimation head')
+    
+    parser.add_argument("--eval_interval", type=int, default=500, help="Evaluate every N iterations")
     args = parser.parse_args()
+
+    # 固定随机种子
+    if args.seed is not None:
+        set_seed(args.seed)
+
     populate_name_lists(
         args,
         {

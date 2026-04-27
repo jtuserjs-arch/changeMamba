@@ -26,20 +26,31 @@ class ChangeMambaBCD(nn.Module):
         )
         self.main_clf = build_head(out_channels=2)
         self.use_uncertainty = use_uncertainty
+         # 如果启用不确定性，则分类头加入 Dropout
+        if use_uncertainty:
+            self.main_clf = build_head(out_channels=2, dropout_rate=dropout_rate)
+        else:
+            self.main_clf = build_head(out_channels=2)
 
-    def forward(self, pre_data, post_data):
+    def forward(self, pre_data, post_data, return_uncertainty=False):
         pre_features = self.encoder(pre_data)
         post_features = self.encoder(post_data)
-        
         out = self.decoder(pre_features, post_features)
-        
+
         if self.use_uncertainty:
             change_feat, uncertainty, gate_weights = out
-            # 存储以便外部访问（例如用于可视化或损失计算）
+            # 存储到属性，方便外部获取（用于可视化）
             self.last_uncertainty = uncertainty
             self.last_gate_weights = gate_weights
         else:
-            change_feat, _, _ = out   # gate_weights 可以忽略
-        
+            change_feat, _, _ = out   # gate_weights 为 None
+
         logits = self.main_clf(change_feat)
-        return resize_to_input(logits, pre_data)
+
+        # 添加这一行：上采样到输入图像的尺寸（例如 256×256）
+        logits = F.interpolate(logits, size=pre_data.shape[-2:], mode='bilinear')
+
+        if return_uncertainty and self.use_uncertainty:
+            return logits, uncertainty, gate_weights
+        else:
+            return logits
