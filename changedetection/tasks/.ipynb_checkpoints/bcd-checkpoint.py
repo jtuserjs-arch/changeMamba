@@ -1,6 +1,7 @@
 import os
 import json
-
+import time
+import datetime
 import imageio
 import torch
 import torch.nn.functional as F
@@ -212,7 +213,7 @@ class BCDTrainer(BaseTrainer):
         }
 
     def selection_metric(self, eval_results):
-        return eval_results["Validation"]["kappa"]
+        return eval_results["Validation"]["f1"]
 
     def format_eval_result(self, split_name, iteration, total_iterations, metrics):
         return format_log_block(
@@ -248,6 +249,20 @@ class BCDTrainer(BaseTrainer):
         )
 
     def _save_metrics(self, iteration, split_name, metrics):
+        now = time.time()
+        elapsed_seconds = now - getattr(self, "train_start_time", now)
+        if iteration > 0:
+            seconds_per_iter = elapsed_seconds / iteration
+            remaining_iters = self.args.max_iters - iteration
+            eta_seconds = remaining_iters * seconds_per_iter
+            eta_time = datetime.datetime.fromtimestamp(now + eta_seconds).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        else:
+            seconds_per_iter = None
+            eta_seconds = None
+            eta_time = None
+
         record = {
             "iter": int(iteration),
             "split": split_name,
@@ -257,11 +272,13 @@ class BCDTrainer(BaseTrainer):
             "precision": float(metrics["precision"]),
             "oa": float(metrics["oa"]),
             "kappa": float(metrics["kappa"]),
-        }
 
+            "elapsed_seconds": elapsed_seconds,
+            "seconds_per_iter": seconds_per_iter,
+            "eta_seconds": eta_seconds,
+            "estimated_finish_time": eta_time,
+         }
         self.metrics_history.append(record)
-
-        os.makedirs(self.args.model_param_path, exist_ok=True)
 
         save_path = os.path.join(
             self.args.model_param_path,
@@ -315,9 +332,10 @@ class BCDTrainer(BaseTrainer):
                     metrics,
                 )
             )
+            
 
         model.train()
-
+        self.train_start_time = time.time()
         data_iter = iter(train_loader)
         total_iters = args.max_iters - getattr(args, "start_iter", 0)
 
@@ -446,6 +464,15 @@ class BCDInferer(BaseInferer):
             self.args.model_type,
             "gate_weights",
         )
+        self.prob_saved_path = os.path.join(
+            self.args.result_saved_path,
+            self.args.dataset,
+            self.args.model_type,
+            "prob_change",
+        )
+
+        if getattr(self.args, "save_prob", False):
+            os.makedirs(self.prob_saved_path, exist_ok=True)
 
         if getattr(self.args, "save_uncertainty", False):
             os.makedirs(self.uncertainty_saved_path, exist_ok=True)
@@ -492,7 +519,24 @@ class BCDInferer(BaseInferer):
             )
 
             imageio.imwrite(save_path, unc_img)
+            
+    def _save_prob_maps(self, prob_change, names):
+        """
+        prob_change: torch.Tensor, [B, H, W]
+        Save as uint16 png, value range [0, 65535].
+        """
+        prob_change = prob_change.detach().cpu().float().clamp(0, 1).numpy()
 
+        for i, name in enumerate(names):
+            prob_img = (prob_change[i] * 65535).clip(0, 65535).astype("uint16")
+
+            image_name = os.path.splitext(name)[0] + ".png"
+            save_path = os.path.join(
+                self.prob_saved_path,
+                image_name,
+            )
+
+            imageio.imwrite(save_path, prob_img)
     def _save_gate_weight_maps(self, gate_weights, output_size, names):
         """
         gate_weights: torch.Tensor, [B, 3, h, w]
@@ -528,7 +572,86 @@ class BCDInferer(BaseInferer):
                 )
 
                 imageio.imwrite(save_path, gate_img)
+    def _apply_perturbation(self, pre_change_imgs, post_change_imgs):
+        perturb_type = getattr(self.args, "perturb_type", "none")
 
+        if perturb_type == "none":
+            return pre_change_imgs, post_change_imgs
+
+        if perturb_type == "noise":
+            noise_std = getattr(self.args, "noise_std", 0.03)
+
+            pre_change_imgs = pre_change_imgs + torch.randn_like(pre_change_imgs) * noise_std
+            post_change_imgs = post_change_imgs + torch.randn_like(post_change_imgs) * noise_std
+
+            pre_change_imgs = pre_change_imgs.clamp(0, 1)
+            post_change_imgs = post_change_imgs.clamp(0, 1)
+
+            return pre_change_imgs, post_change_imgs
+
+        if perturb_type == "blur":
+            blur_kernel = getattr(self.args, "blur_kernel", 5)
+            pre_change_imgs = self._gaussian_blur_tensor(pre_change_imgs, blur_kernel)
+            post_change_imgs = self._gaussian_blur_tensor(post_change_imgs, blur_kernel)
+
+            return pre_change_imgs, post_change_imgs
+
+        if perturb_type == "shift":
+            shift_pixels = getattr(self.args, "shift_pixels", 4)
+
+            # 只平移 post 图像，模拟双时相配准误差
+            post_change_imgs = self._shift_tensor_zero_pad(post_change_imgs, shift_pixels)
+
+            return pre_change_imgs, post_change_imgs
+
+        raise ValueError(f"Unsupported perturb_type: {perturb_type}")
+
+    def _gaussian_blur_tensor(self, x, kernel_size=5, sigma=1.0):
+        if kernel_size <= 1:
+            return x
+
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        device = x.device
+        dtype = x.dtype
+
+        coords = torch.arange(kernel_size, device=device, dtype=dtype)
+        coords = coords - (kernel_size - 1) / 2.0
+
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+
+        kernel_2d = g[:, None] * g[None, :]
+        kernel_2d = kernel_2d.expand(x.shape[1], 1, kernel_size, kernel_size)
+
+        padding = kernel_size // 2
+
+        return F.conv2d(
+            x,
+            kernel_2d,
+            padding=padding,
+            groups=x.shape[1],
+        )
+
+    def _shift_tensor_zero_pad(self, x, shift_pixels=4):
+        if shift_pixels == 0:
+            return x
+
+        b, c, h, w = x.shape
+        out = torch.zeros_like(x)
+
+        s = abs(shift_pixels)
+
+        if s >= h or s >= w:
+            return out
+
+        if shift_pixels > 0:
+            out[:, :, s:, s:] = x[:, :, : h - s, : w - s]
+        else:
+            out[:, :, : h - s, : w - s] = x[:, :, s:, s:]
+
+        return out
     def infer_batch(self, batch):
         pre_change_imgs, post_change_imgs, labels, names = batch
 
@@ -538,14 +661,28 @@ class BCDInferer(BaseInferer):
 
         save_uncertainty = getattr(self.args, "save_uncertainty", False)
         save_gate_weights = getattr(self.args, "save_gate_weights", False)
+        save_prob = getattr(self.args, "save_prob", False)
+
         use_uncertainty = getattr(self.args, "use_uncertainty", False)
         mc_samples = getattr(self.args, "mc_samples", 0)
 
+        change_threshold = getattr(self.args, "change_threshold", 0.5)
+        
+        # 鲁棒性扰动：noise / blur / shift
+        pre_change_imgs, post_change_imgs = self._apply_perturbation(
+            pre_change_imgs,
+            post_change_imgs,
+        )
+
         self.model.eval()
+
+        prob_change = None
+        uncertainty = None
+        gate_weights = None
 
         with torch.no_grad():
             if mc_samples > 0:
-                # 注意：你的仓库里 mc_dropout.py 在 utils_func 下
+                # MC Dropout 分支：当前只保存 pred / uncertainty / gate
                 from changedetection.utils_func.mc_dropout import mc_dropout_inference
 
                 pred_tensor, uncertainty, gate_weights = mc_dropout_inference(
@@ -579,7 +716,13 @@ class BCDInferer(BaseInferer):
                     uncertainty = None
                     gate_weights = None
 
-                pred = torch.argmax(output, dim=1).detach().cpu().numpy()
+                # 保存概率图和阈值预测都基于 changed-class probability
+                prob_change = F.softmax(output, dim=1)[:, 1]
+
+                pred = (
+                    prob_change > change_threshold
+                ).long().detach().cpu().numpy()
+
                 output_size = output.shape[-2:]
 
         # 计算指标
@@ -587,6 +730,10 @@ class BCDInferer(BaseInferer):
 
         # 保存变化检测结果
         self._save_change_maps(pred, names)
+
+        # 保存 changed-class probability，用于 ECE / Risk-Coverage
+        if save_prob and prob_change is not None:
+            self._save_prob_maps(prob_change, names)
 
         # 保存 Evidential 或 MC 不确定性图
         if save_uncertainty:

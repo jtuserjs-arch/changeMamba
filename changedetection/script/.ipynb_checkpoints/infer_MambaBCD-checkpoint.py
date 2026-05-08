@@ -86,6 +86,46 @@ def main():
         action="store_true",
         help="Save dynamic gate weight maps.",
     )
+    parser.add_argument(
+        "--save_prob",
+        action="store_true",
+        help="Save changed-class probability maps.",
+    )
+    parser.add_argument(
+        "--change_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for changed-class probability.",
+    )
+
+    parser.add_argument(
+        "--perturb_type",
+        type=str,
+        default="none",
+        choices=["none", "noise", "blur", "shift"],
+        help="Perturbation type for robustness evaluation.",
+    )
+
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.03,
+        help="Gaussian noise standard deviation.",
+    )
+
+    parser.add_argument(
+        "--blur_kernel",
+        type=int,
+        default=5,
+        help="Gaussian blur kernel size.",
+    )
+
+    parser.add_argument(
+        "--shift_pixels",
+        type=int,
+        default=4,
+        help="Shift pixels for misregistration robustness test.",
+    )
 
     args = parser.parse_args()
 

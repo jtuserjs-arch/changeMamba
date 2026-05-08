@@ -42,3 +42,50 @@ class ResBlock(nn.Module):
         out += identity
         out = self.relu(out)
         return out
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrossAttention(nn.Module):
+    """
+    Cross-attention for two feature maps
+    f1, f2: [B, C, H, W]
+    """
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.scale = (dim // num_heads) ** -0.5
+
+        # QKV projection
+        self.qkv1 = nn.Conv2d(dim, dim*3, 1)
+        self.qkv2 = nn.Conv2d(dim, dim*3, 1)
+
+        # output projection
+        self.proj1 = nn.Conv2d(dim, dim, 1)
+        self.proj2 = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, f1, f2):
+        B, C, H, W = f1.shape
+
+        # reshape for multi-head attention
+        def split_qkv(x, qkv_layer):
+            qkv = qkv_layer(x).reshape(B, 3, self.num_heads, C//self.num_heads, H*W)
+            return qkv[:,0], qkv[:,1], qkv[:,2]
+
+        q1, k1, v1 = split_qkv(f1, self.qkv1)
+        q2, k2, v2 = split_qkv(f2, self.qkv2)
+
+        # f1 attends f2
+        attn1 = torch.einsum('bhcd,bhce->bhde', q1, k2) * self.scale
+        attn1 = F.softmax(attn1, dim=-1)
+        out1 = torch.einsum('bhde,bhce->bhcd', attn1, v2).reshape(B, C, H, W)
+        out1 = self.proj1(out1) + f1  # residual
+
+        # f2 attends f1
+        attn2 = torch.einsum('bhcd,bhce->bhde', q2, k1) * self.scale
+        attn2 = F.softmax(attn2, dim=-1)
+        out2 = torch.einsum('bhde,bhce->bhcd', attn2, v1).reshape(B, C, H, W)
+        out2 = self.proj2(out2) + f2
+
+        return out1, out2
