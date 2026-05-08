@@ -121,7 +121,10 @@ def main():
         default=None,
         help="Random seed for reproducibility.",
     )
-
+    parser.add_argument("--interaction_mode", type=str, default="cafim",
+                    choices=["none", "cafim"])
+    parser.add_argument("--interaction_stages", type=int, nargs="+", default=[2, 3])
+    parser.add_argument("--interaction_reduction", type=int, default=4)
     args = parser.parse_args()
 
     if args.seed is not None:

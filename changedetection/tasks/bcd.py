@@ -2,7 +2,8 @@ import os
 import json
 import time
 import datetime
-import imageio
+
+import imageio.v2 as imageio
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -17,11 +18,72 @@ from changedetection.script.script_utils import get_vssm_kwargs
 
 
 # ------------------------------------------------------------
+# Utility
+# ------------------------------------------------------------
+def _parse_interaction_stages(value, default=(2, 3)):
+    """
+    Accept:
+        None
+        int
+        list / tuple, e.g. [2, 3]
+        string, e.g. "2 3" or "2,3"
+    Return:
+        tuple of int
+    """
+    if value is None:
+        return tuple(default)
+
+    if isinstance(value, int):
+        return (value,)
+
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+        if len(value) == 0:
+            return tuple(default)
+        return tuple(int(v) for v in value)
+
+    return tuple(int(v) for v in value)
+
+    
+def _squeeze_label(labels):
+    """
+    Support labels in [B, H, W] or [B, 1, H, W].
+    """
+    if labels.dim() == 4 and labels.shape[1] == 1:
+        labels = labels[:, 0]
+    return labels
+
+
+def _safe_float(value):
+    """
+    Convert torch / numpy / python scalar to json-safe float.
+    """
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _metrics_to_jsonable(metrics):
+    """
+    Convert metric dict to pure python floats.
+    """
+    return {
+        "recall": _safe_float(metrics["recall"]),
+        "precision": _safe_float(metrics["precision"]),
+        "oa": _safe_float(metrics["oa"]),
+        "f1": _safe_float(metrics["f1"]),
+        "iou": _safe_float(metrics["iou"]),
+        "kappa": _safe_float(metrics["kappa"]),
+    }
+
+
+# ------------------------------------------------------------
 # Evidential Uncertainty Loss
 # ------------------------------------------------------------
 def dirichlet_kl(alpha, num_classes=2):
     """
     KL(Dir(alpha) || Dir(1))
+
     alpha: [N, C]
     """
     beta = torch.ones_like(alpha)
@@ -30,10 +92,14 @@ def dirichlet_kl(alpha, num_classes=2):
     sum_beta = torch.sum(beta, dim=1, keepdim=True)
 
     lnB_alpha = torch.lgamma(sum_alpha) - torch.sum(
-        torch.lgamma(alpha), dim=1, keepdim=True
+        torch.lgamma(alpha),
+        dim=1,
+        keepdim=True,
     )
     lnB_beta = torch.sum(
-        torch.lgamma(beta), dim=1, keepdim=True
+        torch.lgamma(beta),
+        dim=1,
+        keepdim=True,
     ) - torch.lgamma(sum_beta)
 
     digamma_alpha = torch.digamma(alpha)
@@ -52,27 +118,29 @@ def edl_digamma_loss(alpha, target, num_classes=2, ignore_index=255):
     """
     Evidential deep learning loss.
 
-    alpha:  [B, C, H, W]
-    target: [B, H, W]
+    alpha:
+        [B, C, H, W]
+    target:
+        [B, H, W]
     """
+    target = _squeeze_label(target)
     valid_mask = target != ignore_index
 
     if valid_mask.sum() == 0:
         return alpha.sum() * 0.0
 
     alpha = alpha.permute(0, 2, 3, 1)[valid_mask]  # [N, C]
-    target = target[valid_mask]                    # [N]
+    target = target[valid_mask]  # [N]
 
     y = F.one_hot(target, num_classes=num_classes).float()
 
-    S = torch.sum(alpha, dim=1, keepdim=True)
-
+    evidence_sum = torch.sum(alpha, dim=1, keepdim=True)
     data_fit = torch.sum(
-        y * (torch.digamma(S) - torch.digamma(alpha)),
+        y * (torch.digamma(evidence_sum) - torch.digamma(alpha)),
         dim=1,
     )
 
-    # 只惩罚错误类别的 evidence
+    # Only regularize evidence of incorrect classes.
     alpha_tilde = y + (1.0 - y) * alpha
     kl = dirichlet_kl(alpha_tilde, num_classes=num_classes)
 
@@ -99,6 +167,12 @@ class BCDTrainer(BaseTrainer):
             gate_mode=getattr(self.args, "gate_mode", "pixel"),
             use_uncertainty=getattr(self.args, "use_uncertainty", False),
             dropout_rate=getattr(self.args, "dropout_rate", 0.2),
+            interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
+            interaction_stages=_parse_interaction_stages(
+                getattr(self.args, "interaction_stages", (2, 3)),
+                default=(2, 3),
+            ),
+            interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )
 
@@ -113,7 +187,7 @@ class BCDTrainer(BaseTrainer):
 
         pre_change_imgs = pre_change_imgs.to(self.device).float()
         post_change_imgs = post_change_imgs.to(self.device).float()
-        labels = labels.to(self.device).long()
+        labels = _squeeze_label(labels.to(self.device).long())
 
         use_uncertainty = getattr(self.args, "use_uncertainty", False)
 
@@ -127,7 +201,11 @@ class BCDTrainer(BaseTrainer):
             output = output_dict["logits"]
             alpha = output_dict["alpha"]
 
-            ce_loss = F.cross_entropy(output, labels, ignore_index=255)
+            ce_loss = F.cross_entropy(
+                output,
+                labels,
+                ignore_index=255,
+            )
             lovasz_loss = L.lovasz_softmax(
                 F.softmax(output, dim=1),
                 labels,
@@ -160,7 +238,11 @@ class BCDTrainer(BaseTrainer):
 
         output = self.model(pre_change_imgs, post_change_imgs)
 
-        ce_loss = F.cross_entropy(output, labels, ignore_index=255)
+        ce_loss = F.cross_entropy(
+            output,
+            labels,
+            ignore_index=255,
+        )
         lovasz_loss = L.lovasz_softmax(
             F.softmax(output, dim=1),
             labels,
@@ -191,7 +273,7 @@ class BCDTrainer(BaseTrainer):
             for pre_change_imgs, post_change_imgs, labels, _ in data_loader:
                 pre_change_imgs = pre_change_imgs.to(self.device).float()
                 post_change_imgs = post_change_imgs.to(self.device).float()
-                labels = labels.to(self.device).long()
+                labels = _squeeze_label(labels.to(self.device).long())
 
                 output = self.model(pre_change_imgs, post_change_imgs)
                 predictions = torch.argmax(output, dim=1).cpu().numpy()
@@ -248,9 +330,10 @@ class BCDTrainer(BaseTrainer):
             },
         )
 
-    def _save_metrics(self, iteration, split_name, metrics):
+    def _build_metric_record(self, iteration, split_name, metrics):
         now = time.time()
         elapsed_seconds = now - getattr(self, "train_start_time", now)
+
         if iteration > 0:
             seconds_per_iter = elapsed_seconds / iteration
             remaining_iters = self.args.max_iters - iteration
@@ -263,38 +346,152 @@ class BCDTrainer(BaseTrainer):
             eta_seconds = None
             eta_time = None
 
+        metrics = _metrics_to_jsonable(metrics)
+
         record = {
             "iter": int(iteration),
             "split": split_name,
-            "f1": float(metrics["f1"]),
-            "iou": float(metrics["iou"]),
-            "recall": float(metrics["recall"]),
-            "precision": float(metrics["precision"]),
-            "oa": float(metrics["oa"]),
-            "kappa": float(metrics["kappa"]),
-
+            "f1": metrics["f1"],
+            "iou": metrics["iou"],
+            "recall": metrics["recall"],
+            "precision": metrics["precision"],
+            "oa": metrics["oa"],
+            "kappa": metrics["kappa"],
             "elapsed_seconds": elapsed_seconds,
             "seconds_per_iter": seconds_per_iter,
             "eta_seconds": eta_seconds,
             "estimated_finish_time": eta_time,
-         }
+        }
+
+        return record
+
+    def _save_metrics(self, iteration, split_name, metrics):
+        """
+        Save metric history of every evaluation point.
+        """
+        record = self._build_metric_record(iteration, split_name, metrics)
         self.metrics_history.append(record)
 
         save_path = os.path.join(
             self.args.model_param_path,
             "metrics_history.json",
         )
-
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(self.metrics_history, f, indent=2)
 
+    def _make_best_record(self, iteration, score, metrics):
+        """
+        Build a complete best-record dict for the current best Validation result.
+        """
+        return {
+            "iteration": int(iteration),
+            "score": float(score),
+            "selection_metric": "Validation/F1",
+            "results": {
+                "Validation": _metrics_to_jsonable(metrics),
+            },
+        }
+
+    def _save_best_metrics(self, best_record):
+        """
+        Save the complete metric values of the best Validation checkpoint.
+        Files:
+            best_metrics.json
+            best_metrics.txt
+        """
+        os.makedirs(self.args.model_param_path, exist_ok=True)
+
+        save_json_path = os.path.join(
+            self.args.model_param_path,
+            "best_metrics.json",
+        )
+        with open(save_json_path, "w", encoding="utf-8") as f:
+            json.dump(best_record, f, indent=2)
+
+        metrics = best_record["results"]["Validation"]
+
+        save_txt_path = os.path.join(
+            self.args.model_param_path,
+            "best_metrics.txt",
+        )
+        with open(save_txt_path, "w", encoding="utf-8") as f:
+            f.write("BEST Validation Metrics\n")
+            f.write(f"Iter      : {best_record['iteration']}\n")
+            f.write(f"Metric    : {best_record['selection_metric']}\n")
+            f.write(f"Best F1   : {metrics['f1']:.6f}\n")
+            f.write(f"Recall    : {metrics['recall']:.6f}\n")
+            f.write(f"Precision : {metrics['precision']:.6f}\n")
+            f.write(f"OA        : {metrics['oa']:.6f}\n")
+            f.write(f"IoU       : {metrics['iou']:.6f}\n")
+            f.write(f"Kappa     : {metrics['kappa']:.6f}\n")
+
+    def _save_final_test_metrics(self, test_metrics):
+        """
+        Save final Test metrics. When best_model.pth exists, final Test uses
+        the best Validation checkpoint.
+        """
+        metrics = _metrics_to_jsonable(test_metrics)
+
+        save_json_path = os.path.join(
+            self.args.model_param_path,
+            "final_test_metrics.json",
+        )
+        with open(save_json_path, "w", encoding="utf-8") as f:
+            json.dump({"Test": metrics}, f, indent=2)
+
+        save_txt_path = os.path.join(
+            self.args.model_param_path,
+            "final_test_metrics.txt",
+        )
+        with open(save_txt_path, "w", encoding="utf-8") as f:
+            f.write("FINAL Test Metrics\n")
+            f.write("Checkpoint : best_model.pth if available, otherwise last iteration model\n")
+            f.write(f"F1        : {metrics['f1']:.6f}\n")
+            f.write(f"Recall    : {metrics['recall']:.6f}\n")
+            f.write(f"Precision : {metrics['precision']:.6f}\n")
+            f.write(f"OA        : {metrics['oa']:.6f}\n")
+            f.write(f"IoU       : {metrics['iou']:.6f}\n")
+            f.write(f"Kappa     : {metrics['kappa']:.6f}\n")
+
+    def _load_best_model_for_final_test(self, model):
+        """
+        Load best_model.pth before final Test evaluation.
+        Return True if loaded successfully.
+        """
+        best_model_path = os.path.join(
+            self.args.model_param_path,
+            "best_model.pth",
+        )
+
+        if not os.path.exists(best_model_path):
+            self.emit_log(
+                "best_model.pth not found. Final Test will use the last iteration model."
+            )
+            return False
+
+        checkpoint = torch.load(best_model_path, map_location=self.device)
+
+        # Compatible with raw state_dict and common checkpoint formats.
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif isinstance(checkpoint, dict) and "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
+
+        model.load_state_dict(state_dict, strict=True)
+
+        self.emit_log(f"Loaded best model for final Test: {best_model_path}")
+        return True
+
     def training(self):
         """
-        自定义训练循环：
-        1. tqdm 显示训练进度；
-        2. 每 eval_interval 次验证一次；
-        3. 根据 Validation Kappa 保存 best_model.pth；
-        4. 训练结束后在 Test 上评估。
+        Custom training loop:
+            1. show tqdm progress;
+            2. evaluate every eval_interval iterations;
+            3. save best_model.pth according to Validation F1;
+            4. save best_metrics.json / best_metrics.txt;
+            5. evaluate Test split using best_model.pth after training.
         """
         args = self.args
         model = self.model
@@ -304,6 +501,7 @@ class BCDTrainer(BaseTrainer):
 
         best_score = -1.0
         best_iter = 0
+        best_record = None
 
         eval_loaders = self.build_eval_loaders()
         val_loader = eval_loaders.get("Validation", None)
@@ -311,31 +509,38 @@ class BCDTrainer(BaseTrainer):
 
         os.makedirs(args.model_param_path, exist_ok=True)
 
-        # 初始验证
+        # Initial validation.
         if val_loader is not None and getattr(args, "start_iter", 0) == 0:
             metrics = self.evaluate_loader("Validation", val_loader)
             self._save_metrics(0, "Validation", metrics)
 
             best_score = self.selection_metric({"Validation": metrics})
             best_iter = 0
+            best_record = self._make_best_record(
+                iteration=best_iter,
+                score=best_score,
+                metrics=metrics,
+            )
 
             torch.save(
                 model.state_dict(),
                 os.path.join(args.model_param_path, "best_model.pth"),
             )
+            self._save_best_metrics(best_record)
 
-            self.emit_log(
-                self.format_eval_result(
-                    "Validation",
-                    0,
-                    args.max_iters,
-                    metrics,
-                )
+            log_msg = self.format_eval_result(
+                "Validation",
+                0,
+                args.max_iters,
+                metrics,
             )
-            
+            log_msg += "\n" + self.format_best_result(best_record)
+            log_msg += "\n[NEW BEST] Best model and best_metrics files have been updated."
+            self.emit_log(log_msg)
 
         model.train()
         self.train_start_time = time.time()
+
         data_iter = iter(train_loader)
         total_iters = args.max_iters - getattr(args, "start_iter", 0)
 
@@ -377,15 +582,22 @@ class BCDTrainer(BaseTrainer):
                     self._save_metrics(iteration, "Validation", metrics)
 
                     score = self.selection_metric({"Validation": metrics})
+                    is_best = score > best_score
 
-                    if score > best_score:
+                    if is_best:
                         best_score = score
                         best_iter = iteration
+                        best_record = self._make_best_record(
+                            iteration=best_iter,
+                            score=best_score,
+                            metrics=metrics,
+                        )
 
                         torch.save(
                             model.state_dict(),
                             os.path.join(args.model_param_path, "best_model.pth"),
                         )
+                        self._save_best_metrics(best_record)
 
                     log_msg = self.format_eval_result(
                         "Validation",
@@ -393,14 +605,26 @@ class BCDTrainer(BaseTrainer):
                         args.max_iters,
                         metrics,
                     )
+
+                    if best_record is not None:
+                        log_msg += "\n" + self.format_best_result(best_record)
+
+                    if is_best:
+                        log_msg += (
+                            "\n[NEW BEST] Best model and best_metrics files "
+                            "have been updated."
+                        )
+
                     self.emit_log(log_msg)
 
                     model.train()
 
-        # 最终测试
+        # Final test: use the best Validation checkpoint when available.
         if test_loader is not None:
+            self._load_best_model_for_final_test(model)
             test_metrics = self.evaluate_loader("Test", test_loader)
             self._save_metrics(args.max_iters, "Test", test_metrics)
+            self._save_final_test_metrics(test_metrics)
 
             self.emit_log(
                 self.format_eval_result(
@@ -418,7 +642,10 @@ class BCDTrainer(BaseTrainer):
             f"Best model saved to "
             f"{os.path.join(args.model_param_path, 'best_model.pth')}"
         )
-
+        self.emit_log(
+            f"Best metrics saved to "
+            f"{os.path.join(args.model_param_path, 'best_metrics.txt')}"
+        )
 
 # ------------------------------------------------------------
 # Inferer
@@ -436,6 +663,12 @@ class BCDInferer(BaseInferer):
             gate_mode=getattr(self.args, "gate_mode", "pixel"),
             use_uncertainty=getattr(self.args, "use_uncertainty", False),
             dropout_rate=getattr(self.args, "dropout_rate", 0.0),
+            interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
+            interaction_stages=_parse_interaction_stages(
+                getattr(self.args, "interaction_stages", (2, 3)),
+                default=(2, 3),
+            ),
+            interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )
 
@@ -457,7 +690,6 @@ class BCDInferer(BaseInferer):
             self.args.model_type,
             "uncertainty",
         )
-
         self.gate_weights_path = os.path.join(
             self.args.result_saved_path,
             self.args.dataset,
@@ -482,7 +714,8 @@ class BCDInferer(BaseInferer):
 
     def _save_change_maps(self, pred, names):
         """
-        pred: [B, H, W], numpy array
+        pred:
+            numpy array, [B, H, W]
         """
         for i, name in enumerate(names):
             binary_change_map = pred[i].astype("uint8")
@@ -493,12 +726,12 @@ class BCDInferer(BaseInferer):
                 self.change_map_saved_path,
                 image_name,
             )
-
             imageio.imwrite(save_path, binary_change_map)
 
     def _save_uncertainty_maps(self, uncertainty, names):
         """
-        uncertainty: torch.Tensor, [B, 1, H, W] or [B, H, W]
+        uncertainty:
+            torch.Tensor, [B, 1, H, W] or [B, H, W]
         """
         if uncertainty is None:
             return
@@ -517,12 +750,13 @@ class BCDInferer(BaseInferer):
                 self.uncertainty_saved_path,
                 image_name,
             )
-
             imageio.imwrite(save_path, unc_img)
-            
+
     def _save_prob_maps(self, prob_change, names):
         """
-        prob_change: torch.Tensor, [B, H, W]
+        prob_change:
+            torch.Tensor, [B, H, W]
+
         Save as uint16 png, value range [0, 65535].
         """
         prob_change = prob_change.detach().cpu().float().clamp(0, 1).numpy()
@@ -535,12 +769,15 @@ class BCDInferer(BaseInferer):
                 self.prob_saved_path,
                 image_name,
             )
-
             imageio.imwrite(save_path, prob_img)
+
     def _save_gate_weight_maps(self, gate_weights, output_size, names):
         """
-        gate_weights: torch.Tensor, [B, 3, h, w]
-        output_size: (H, W)
+        gate_weights:
+            torch.Tensor, [B, 3, h, w] or [B, 3, 1, 1]
+
+        output_size:
+            (H, W)
         """
         if gate_weights is None:
             return
@@ -554,7 +791,6 @@ class BCDInferer(BaseInferer):
             )
 
         gate_weights = gate_weights.detach().cpu().float().clamp(0, 1).numpy()
-
         gate_names = ["seq", "cross", "par"]
 
         for i, name in enumerate(names):
@@ -565,13 +801,12 @@ class BCDInferer(BaseInferer):
                     continue
 
                 gate_img = (gate_weights[i, j] * 255).clip(0, 255).astype("uint8")
-
                 save_path = os.path.join(
                     self.gate_weights_path,
                     f"{base_name}_{gate_name}.png",
                 )
-
                 imageio.imwrite(save_path, gate_img)
+
     def _apply_perturbation(self, pre_change_imgs, post_change_imgs):
         perturb_type = getattr(self.args, "perturb_type", "none")
 
@@ -591,6 +826,7 @@ class BCDInferer(BaseInferer):
 
         if perturb_type == "blur":
             blur_kernel = getattr(self.args, "blur_kernel", 5)
+
             pre_change_imgs = self._gaussian_blur_tensor(pre_change_imgs, blur_kernel)
             post_change_imgs = self._gaussian_blur_tensor(post_change_imgs, blur_kernel)
 
@@ -599,8 +835,11 @@ class BCDInferer(BaseInferer):
         if perturb_type == "shift":
             shift_pixels = getattr(self.args, "shift_pixels", 4)
 
-            # 只平移 post 图像，模拟双时相配准误差
-            post_change_imgs = self._shift_tensor_zero_pad(post_change_imgs, shift_pixels)
+            # Only shift post image to simulate bi-temporal misregistration.
+            post_change_imgs = self._shift_tensor_zero_pad(
+                post_change_imgs,
+                shift_pixels,
+            )
 
             return pre_change_imgs, post_change_imgs
 
@@ -623,7 +862,12 @@ class BCDInferer(BaseInferer):
         g = g / g.sum()
 
         kernel_2d = g[:, None] * g[None, :]
-        kernel_2d = kernel_2d.expand(x.shape[1], 1, kernel_size, kernel_size)
+        kernel_2d = kernel_2d.expand(
+            x.shape[1],
+            1,
+            kernel_size,
+            kernel_size,
+        )
 
         padding = kernel_size // 2
 
@@ -642,7 +886,6 @@ class BCDInferer(BaseInferer):
         out = torch.zeros_like(x)
 
         s = abs(shift_pixels)
-
         if s >= h or s >= w:
             return out
 
@@ -652,23 +895,23 @@ class BCDInferer(BaseInferer):
             out[:, :, : h - s, : w - s] = x[:, :, s:, s:]
 
         return out
+
     def infer_batch(self, batch):
         pre_change_imgs, post_change_imgs, labels, names = batch
 
         pre_change_imgs = pre_change_imgs.to(self.device).float()
         post_change_imgs = post_change_imgs.to(self.device).float()
-        labels = labels.to(self.device).long()
+        labels = _squeeze_label(labels.to(self.device).long())
 
         save_uncertainty = getattr(self.args, "save_uncertainty", False)
         save_gate_weights = getattr(self.args, "save_gate_weights", False)
         save_prob = getattr(self.args, "save_prob", False)
-
         use_uncertainty = getattr(self.args, "use_uncertainty", False)
-        mc_samples = getattr(self.args, "mc_samples", 0)
 
+        mc_samples = getattr(self.args, "mc_samples", 0)
         change_threshold = getattr(self.args, "change_threshold", 0.5)
-        
-        # 鲁棒性扰动：noise / blur / shift
+
+        # Robustness perturbation: none / noise / blur / shift.
         pre_change_imgs, post_change_imgs = self._apply_perturbation(
             pre_change_imgs,
             post_change_imgs,
@@ -682,7 +925,8 @@ class BCDInferer(BaseInferer):
 
         with torch.no_grad():
             if mc_samples > 0:
-                # MC Dropout 分支：当前只保存 pred / uncertainty / gate
+                # MC Dropout branch. The model forward supports return_uncertainty
+                # for compatibility with older mc_dropout.py.
                 from changedetection.utils_func.mc_dropout import mc_dropout_inference
 
                 pred_tensor, uncertainty, gate_weights = mc_dropout_inference(
@@ -707,7 +951,6 @@ class BCDInferer(BaseInferer):
                         post_change_imgs,
                         return_aux=True,
                     )
-
                     output = output_dict["logits"]
                     uncertainty = output_dict.get("uncertainty", None)
                     gate_weights = output_dict.get("gate_weights", None)
@@ -716,30 +959,26 @@ class BCDInferer(BaseInferer):
                     uncertainty = None
                     gate_weights = None
 
-                # 保存概率图和阈值预测都基于 changed-class probability
+                # Save probability map and threshold prediction by changed-class probability.
                 prob_change = F.softmax(output, dim=1)[:, 1]
-
-                pred = (
-                    prob_change > change_threshold
-                ).long().detach().cpu().numpy()
-
+                pred = (prob_change > change_threshold).long().detach().cpu().numpy()
                 output_size = output.shape[-2:]
 
-        # 计算指标
+        # Metrics.
         self.evaluator.add_batch(labels.cpu().numpy(), pred)
 
-        # 保存变化检测结果
+        # Save binary change map.
         self._save_change_maps(pred, names)
 
-        # 保存 changed-class probability，用于 ECE / Risk-Coverage
+        # Save changed-class probability for ECE / Risk-Coverage.
         if save_prob and prob_change is not None:
             self._save_prob_maps(prob_change, names)
 
-        # 保存 Evidential 或 MC 不确定性图
+        # Save evidential or MC uncertainty map.
         if save_uncertainty:
             self._save_uncertainty_maps(uncertainty, names)
 
-        # 保存门控权重图
+        # Save dynamic gate weight maps.
         if save_gate_weights:
             self._save_gate_weight_maps(gate_weights, output_size, names)
 
@@ -759,5 +998,4 @@ class BCDInferer(BaseInferer):
                 },
             )
         )
-
         self.emit_log("Inference stage is done!")

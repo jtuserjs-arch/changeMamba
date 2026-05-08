@@ -126,7 +126,11 @@ def main():
         default=4,
         help="Shift pixels for misregistration robustness test.",
     )
-
+    parser.add_argument("--interaction_mode", type=str, default="cafim",
+                        choices=["none", "cafim"])
+    parser.add_argument("--interaction_stages", type=int, nargs="+", default=[2, 3])
+    parser.add_argument("--interaction_reduction", type=int, default=4)
+    
     args = parser.parse_args()
 
     populate_name_lists(
