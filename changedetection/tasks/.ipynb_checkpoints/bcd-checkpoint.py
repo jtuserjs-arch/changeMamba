@@ -145,8 +145,113 @@ def edl_digamma_loss(alpha, target, num_classes=2, ignore_index=255):
     kl = dirichlet_kl(alpha_tilde, num_classes=num_classes)
 
     return data_fit.mean() + 0.01 * kl.mean()
+def make_boundary_target(mask, ignore_index=255, kernel_size=3):
+    """
+    从二值变化标签生成边界标签。
+
+    mask: [B, H, W]
+    return:
+        edge:  [B, 1, H, W]
+        valid: [B, 1, H, W]
+    """
+    valid = mask != ignore_index
+
+    clean_mask = mask.clone()
+    clean_mask[~valid] = 0
+    clean_mask = clean_mask.float().unsqueeze(1)
+
+    padding = kernel_size // 2
+
+    dilated = F.max_pool2d(
+        clean_mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding,
+    )
+
+    eroded = 1.0 - F.max_pool2d(
+        1.0 - clean_mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding,
+    )
+
+    edge = (dilated - eroded).clamp(0, 1)
+    valid = valid.unsqueeze(1)
+
+    return edge, valid
 
 
+def boundary_bce_loss(edge_logits, labels, ignore_index=255):
+    """
+    edge_logits: [B, 1, H, W]
+    labels:      [B, H, W]
+    """
+    edge_target, valid = make_boundary_target(
+        labels,
+        ignore_index=ignore_index,
+        kernel_size=3,
+    )
+
+    loss = F.binary_cross_entropy_with_logits(
+        edge_logits,
+        edge_target,
+        reduction="none",
+    )
+
+    if valid.sum() == 0:
+        return edge_logits.sum() * 0.0
+
+    return loss[valid].mean()
+
+
+def weighted_ce_loss(logits, labels, pixel_weight=None, ignore_index=255):
+    """
+    用于 uncertainty-guided hard pixel reweighting。
+
+    logits:       [B, 2, H, W]
+    labels:       [B, H, W]
+    pixel_weight: [B, 1, H, W] or None
+    """
+    loss = F.cross_entropy(
+        logits,
+        labels,
+        ignore_index=ignore_index,
+        reduction="none",
+    )
+
+    valid = labels != ignore_index
+
+    if pixel_weight is not None:
+        if pixel_weight.dim() == 4:
+            pixel_weight = pixel_weight.squeeze(1)
+        loss = loss * pixel_weight
+
+    if valid.sum() == 0:
+        return logits.sum() * 0.0
+
+    return loss[valid].mean()
+
+
+def temporal_symmetry_loss(logits_forward, logits_reverse, labels, ignore_index=255):
+    """
+    BCD 任务理论上满足:
+        model(T1, T2) ≈ model(T2, T1)
+
+    这里只让 forward 分支对齐 reverse 分支，reverse 用 detach，节省显存。
+    """
+    valid = labels != ignore_index
+
+    prob_forward = F.softmax(logits_forward, dim=1)
+    prob_reverse = F.softmax(logits_reverse, dim=1).detach()
+
+    diff = (prob_forward - prob_reverse).pow(2).sum(dim=1)
+
+    if valid.sum() == 0:
+        return logits_forward.sum() * 0.0
+
+    return diff[valid].mean()
+    
 # ------------------------------------------------------------
 # Trainer
 # ------------------------------------------------------------
@@ -166,15 +271,43 @@ class BCDTrainer(BaseTrainer):
             pretrained=self.args.pretrained_weight_path,
             gate_mode=getattr(self.args, "gate_mode", "pixel"),
             use_uncertainty=getattr(self.args, "use_uncertainty", False),
+            use_boundary=getattr(self.args, "use_boundary", True),
             dropout_rate=getattr(self.args, "dropout_rate", 0.2),
             interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
-            interaction_stages=_parse_interaction_stages(
-                getattr(self.args, "interaction_stages", (2, 3)),
-                default=(2, 3),
-            ),
+            interaction_stages=getattr(self.args, "interaction_stages", "2,3"),
             interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )
+    def build_optimizer(self):
+        base_params = []
+        new_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if (
+                "feature_interaction" in name
+                or "boundary_refine" in name
+                or "evidence_head" in name
+            ):
+                new_params.append(param)
+            else:
+                base_params.append(param)
+
+        return torch.optim.AdamW(
+                [
+                    {
+                        "params": base_params,
+                        "lr": self.args.learning_rate,
+                    },
+                    {
+                        "params": new_params,
+                        "lr": self.args.learning_rate * 3.0,
+                    },
+                ],
+                weight_decay=self.args.weight_decay,
+            )
 
     def build_train_loader(self):
         return build_train_loader(self.args)
@@ -187,62 +320,60 @@ class BCDTrainer(BaseTrainer):
 
         pre_change_imgs = pre_change_imgs.to(self.device).float()
         post_change_imgs = post_change_imgs.to(self.device).float()
-        labels = _squeeze_label(labels.to(self.device).long())
+        labels = labels.to(self.device).long()
 
         use_uncertainty = getattr(self.args, "use_uncertainty", False)
+        use_boundary = getattr(self.args, "use_boundary", True)
 
-        if use_uncertainty:
+        boundary_weight = getattr(self.args, "boundary_weight", 0.2)
+        uncertainty_weight = getattr(self.args, "uncertainty_weight", 0.01)
+        uncertainty_reweight = getattr(self.args, "uncertainty_reweight", False)
+        uncertainty_reweight_lambda = getattr(self.args, "uncertainty_reweight_lambda", 0.5)
+        sym_loss_weight = getattr(self.args, "sym_loss_weight", 0.0)
+
+        need_aux = use_uncertainty or use_boundary
+
+        if need_aux:
             output_dict = self.model(
                 pre_change_imgs,
                 post_change_imgs,
                 return_aux=True,
             )
-
             output = output_dict["logits"]
-            alpha = output_dict["alpha"]
+        else:
+            output_dict = None
+            output = self.model(pre_change_imgs, post_change_imgs)
 
+        # -------------------------
+        # CE loss
+        # -------------------------
+        pixel_weight = None
+
+        if use_uncertainty and uncertainty_reweight and output_dict is not None:
+            uncertainty = output_dict.get("uncertainty", None)
+
+            if uncertainty is not None:
+                with torch.no_grad():
+                    pixel_weight = 1.0 + uncertainty_reweight_lambda * uncertainty
+                    pixel_weight = pixel_weight.clamp(1.0, 2.0)
+
+        if pixel_weight is not None:
+            ce_loss = weighted_ce_loss(
+                output,
+                labels,
+                pixel_weight=pixel_weight,
+                ignore_index=255,
+            )
+        else:
             ce_loss = F.cross_entropy(
                 output,
                 labels,
                 ignore_index=255,
             )
-            lovasz_loss = L.lovasz_softmax(
-                F.softmax(output, dim=1),
-                labels,
-                ignore=255,
-            )
-            uncertainty_loss = edl_digamma_loss(
-                alpha,
-                labels,
-                num_classes=2,
-                ignore_index=255,
-            )
 
-            uncertainty_weight = getattr(self.args, "uncertainty_weight", 0.01)
-
-            final_loss = (
-                ce_loss
-                + 0.75 * lovasz_loss
-                + uncertainty_weight * uncertainty_loss
-            )
-
-            return {
-                "loss": final_loss,
-                "log_items": {
-                    "loss": final_loss.item(),
-                    "ce": ce_loss.item(),
-                    "lovasz": lovasz_loss.item(),
-                    "uncertainty": uncertainty_loss.item(),
-                },
-            }
-
-        output = self.model(pre_change_imgs, post_change_imgs)
-
-        ce_loss = F.cross_entropy(
-            output,
-            labels,
-            ignore_index=255,
-        )
+        # -------------------------
+        # Lovasz loss
+        # -------------------------
         lovasz_loss = L.lovasz_softmax(
             F.softmax(output, dim=1),
             labels,
@@ -251,13 +382,64 @@ class BCDTrainer(BaseTrainer):
 
         final_loss = ce_loss + 0.75 * lovasz_loss
 
+        log_items = {
+            "loss": final_loss.item(),
+            "ce": ce_loss.item(),
+            "lovasz": lovasz_loss.item(),
+        }
+
+        # -------------------------
+        # Boundary loss
+        # -------------------------
+        if use_boundary and output_dict is not None and "edge_logits" in output_dict:
+            edge_loss = boundary_bce_loss(
+                output_dict["edge_logits"],
+                labels,
+                ignore_index=255,
+            )
+
+            final_loss = final_loss + boundary_weight * edge_loss
+            log_items["edge"] = edge_loss.item()
+
+        # -------------------------
+        # Evidential uncertainty loss
+        # -------------------------
+        if use_uncertainty and output_dict is not None and "alpha" in output_dict:
+            uncertainty_loss = edl_digamma_loss(
+                output_dict["alpha"],
+                labels,
+                num_classes=2,
+                ignore_index=255,
+            )
+
+            final_loss = final_loss + uncertainty_weight * uncertainty_loss
+            log_items["uncertainty"] = uncertainty_loss.item()
+
+        # -------------------------
+        # Temporal symmetry consistency loss
+        # -------------------------
+        if sym_loss_weight > 0:
+            reverse_logits = self.model(
+                post_change_imgs,
+                pre_change_imgs,
+                return_aux=False,
+            )
+
+            sym_loss = temporal_symmetry_loss(
+                output,
+                reverse_logits,
+                labels,
+                ignore_index=255,
+            )
+
+            final_loss = final_loss + sym_loss_weight * sym_loss
+            log_items["sym"] = sym_loss.item()
+
+        log_items["loss"] = final_loss.item()
+
         return {
             "loss": final_loss,
-            "log_items": {
-                "loss": final_loss.item(),
-                "ce": ce_loss.item(),
-                "lovasz": lovasz_loss.item(),
-            },
+            "log_items": log_items,
         }
 
     def evaluate_loader(self, split_name, data_loader):
@@ -662,12 +844,10 @@ class BCDInferer(BaseInferer):
             pretrained=self.args.pretrained_weight_path,
             gate_mode=getattr(self.args, "gate_mode", "pixel"),
             use_uncertainty=getattr(self.args, "use_uncertainty", False),
+            use_boundary=getattr(self.args, "use_boundary", True),
             dropout_rate=getattr(self.args, "dropout_rate", 0.0),
             interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
-            interaction_stages=_parse_interaction_stages(
-                getattr(self.args, "interaction_stages", (2, 3)),
-                default=(2, 3),
-            ),
+            interaction_stages=getattr(self.args, "interaction_stages", "2,3"),
             interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )

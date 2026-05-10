@@ -96,7 +96,7 @@ class CAFIM(nn.Module):
 
         # Zero-init residual scale. This makes CAFIM start as an identity mapping,
         # so it is safer when loading / fine-tuning from the original model.
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, f1, f2):
         diff = torch.abs(f1 - f2)
@@ -160,7 +160,48 @@ class MultiScaleCAFIM(nn.Module):
 
         return pre_features, post_features
 
+class BoundaryRefinementHead(nn.Module):
+    """
+    Boundary-aware refinement module.
 
+    输入:
+        change_feat: [B, 128, H, W]
+
+    输出:
+        refined_feat: [B, 128, H, W]
+        edge_logits:  [B, 1, H, W]
+    """
+    def __init__(self, channels=128):
+        super().__init__()
+
+        mid_channels = max(channels // 2, 32)
+
+        self.edge_head = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1)
+        )
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels + 1, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, change_feat):
+        edge_logits = self.edge_head(change_feat)
+        edge_prob = torch.sigmoid(edge_logits)
+
+        refine_input = torch.cat([change_feat, edge_prob], dim=1)
+        residual = self.refine(refine_input)
+
+        refined_feat = change_feat + residual
+
+        return refined_feat, edge_logits
 class ChangeMambaBCD(nn.Module):
     """
     BCD model for ChangeMamba.
@@ -191,12 +232,13 @@ class ChangeMambaBCD(nn.Module):
         pretrained,
         gate_mode="pixel",
         use_uncertainty=False,
+        use_boundary=True,
         dropout_rate=0.0,
         interaction_mode="cafim",
         interaction_stages=(2, 3),
         interaction_reduction=4,
         **kwargs,
-    ):
+        ):
         super().__init__()
 
         # -------------------------
@@ -233,6 +275,7 @@ class ChangeMambaBCD(nn.Module):
 
         self.gate_mode = gate_mode
         self.use_uncertainty = use_uncertainty
+        self.use_boundary = use_boundary
 
         if gate_mode == "none":
             self.decoder = ChangeDecoder(
@@ -263,6 +306,13 @@ class ChangeMambaBCD(nn.Module):
                 f"Unsupported gate_mode: {gate_mode}. "
                 f"Expected one of ['none', 'image', 'pixel']."
             )
+        # -------------------------
+        # Boundary refinement head
+        # -------------------------
+        if self.use_boundary:
+            self.boundary_refine = BoundaryRefinementHead(channels=128)
+        else:
+            self.boundary_refine = None
 
         # -------------------------
         # Main classification head
@@ -341,7 +391,11 @@ class ChangeMambaBCD(nn.Module):
                 change_feat = decoder_out
         else:
             change_feat = self.decoder(pre_features, post_features)
-
+            
+        edge_logits = None
+        if self.boundary_refine is not None:
+            change_feat, edge_logits = self.boundary_refine(change_feat)
+            
         # -------------------------
         # Main classifier
         # -------------------------
@@ -363,7 +417,9 @@ class ChangeMambaBCD(nn.Module):
             "logits": logits,
             "gate_weights": gate_weights,
         }
-
+        
+        if edge_logits is not None:
+            aux["edge_logits"] = resize_to_input(edge_logits, pre_data)
         if self.use_uncertainty:
             evidence = F.softplus(self.evidence_head(change_feat))
             evidence = resize_to_input(evidence, pre_data)
