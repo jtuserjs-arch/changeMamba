@@ -76,7 +76,17 @@ def _metrics_to_jsonable(metrics):
         "kappa": _safe_float(metrics["kappa"]),
     }
 
+def dice_loss_binary(logits, labels, ignore_index=255, eps=1e-6):
+    probs = torch.softmax(logits, dim=1)[:, 1]
+    valid = labels != ignore_index
 
+    probs = probs[valid]
+    targets = (labels[valid] == 1).float()
+
+    inter = (probs * targets).sum()
+    union = probs.sum() + targets.sum()
+
+    return 1.0 - (2.0 * inter + eps) / (union + eps)
 # ------------------------------------------------------------
 # Evidential Uncertainty Loss
 # ------------------------------------------------------------

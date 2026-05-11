@@ -137,6 +137,7 @@ def main():
         action="store_true",
         help="Enable boundary-aware refinement head.",
     )
+    parser.add_argument("--multi_scale_interaction", action="store_true")
     args = parser.parse_args()
 
     populate_name_lists(

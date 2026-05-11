@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from .model_utils import ResBlock
 from .vmamba import Permute, VSSBlock
 
-
+from .cafim_msi_fusion import CAFIM_MSIFusion
 def make_processing_block(
     *,
     channel_first,
@@ -78,7 +78,7 @@ class DynamicGating(nn.Module):
 
     def __init__(self, hidden_dim=128, mode="pixel", reduction=4):
         super().__init__()
-
+        
         self.mode = mode
         gate_hidden = max(hidden_dim // reduction, 16)
 
@@ -149,19 +149,9 @@ class DynamicGating(nn.Module):
 
         return fused, gate
 
-
 class DynamicChangeDecoder(nn.Module):
     """
-    Dynamic STSS decoder.
-
-    Three branches:
-        1. seq branch: concat pre/post features
-        2. cross branch: interleave pre/post features along width
-        3. par branch: split pre/post features along width
-
-    Output:
-        change_feat: [B, 128, H, W]
-        gate_weights: last-stage gate map, [B, 3, h, w] or [B, 3, 1, 1]
+    Dynamic STSS decoder with unified CAFIM + Multi-Scale Interaction
     """
 
     def __init__(
@@ -174,14 +164,15 @@ class DynamicChangeDecoder(nn.Module):
         mlp_act_layer,
         hidden_dim=128,
         gate_mode="pixel",
+        use_ms_interaction=True,
         **kwargs,
     ):
         super().__init__()
 
         stage_dims = list(reversed(encoder_dims))
-
         self.hidden_dim = hidden_dim
         self.gate_mode = gate_mode
+        self.use_ms_interaction = use_ms_interaction
 
         self.seq_blocks = nn.ModuleList()
         self.cross_blocks = nn.ModuleList()
@@ -230,78 +221,48 @@ class DynamicChangeDecoder(nn.Module):
             )
 
             self.gate_modules.append(
-                DynamicGating(
-                    hidden_dim=hidden_dim,
-                    mode=gate_mode,
-                )
+                DynamicGating(hidden_dim=hidden_dim, mode=gate_mode)
             )
 
             self.fuse_layers.append(
                 nn.Sequential(
-                    nn.Conv2d(
-                        in_channels=hidden_dim,
-                        out_channels=hidden_dim,
-                        kernel_size=1,
-                        bias=False,
-                    ),
+                    nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
                     nn.BatchNorm2d(hidden_dim),
                     nn.ReLU(inplace=True),
                 )
             )
 
+        # 🔥 CAFIM + 多尺度交互统一模块（stage 间）
+        if self.use_ms_interaction:
+            self.cafim_msi = nn.ModuleList(
+                [
+                    CAFIM_MSIFusion(hidden_dim)
+                    for _ in range(len(stage_dims) - 1)
+                ]
+            )
+
         self.smooth_layers = nn.ModuleList(
             [
-                ResBlock(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim,
-                    stride=1,
-                )
+                ResBlock(hidden_dim, hidden_dim, stride=1)
                 for _ in range(len(stage_dims) - 1)
             ]
         )
 
         self.latest_gate_weights = []
 
-    def _upsample_add(self, x, y):
-        return (
-            F.interpolate(
-                x,
-                size=y.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            + y
-        )
-
     def _interleave(self, pre_feat, post_feat):
-        batch_size, channels, height, width = pre_feat.shape
-
-        tensor = pre_feat.new_empty(
-            batch_size,
-            channels,
-            height,
-            2 * width,
-        )
-
-        tensor[:, :, :, ::2] = pre_feat
-        tensor[:, :, :, 1::2] = post_feat
-
-        return tensor
+        B, C, H, W = pre_feat.shape
+        out = pre_feat.new_empty(B, C, H, 2 * W)
+        out[:, :, :, ::2] = pre_feat
+        out[:, :, :, 1::2] = post_feat
+        return out
 
     def _split(self, pre_feat, post_feat):
-        batch_size, channels, height, width = pre_feat.shape
-
-        tensor = pre_feat.new_empty(
-            batch_size,
-            channels,
-            height,
-            2 * width,
-        )
-
-        tensor[:, :, :, :width] = pre_feat
-        tensor[:, :, :, width:] = post_feat
-
-        return tensor
+        B, C, H, W = pre_feat.shape
+        out = pre_feat.new_empty(B, C, H, 2 * W)
+        out[:, :, :, :W] = pre_feat
+        out[:, :, :, W:] = post_feat
+        return out
 
     def forward(self, pre_features, post_features):
         previous = None
@@ -311,48 +272,47 @@ class DynamicChangeDecoder(nn.Module):
         pre_stages = list(reversed(pre_features))
         post_stages = list(reversed(post_features))
 
-        for stage_idx, (pre_feat, post_feat) in enumerate(
+        for i, (pre_feat, post_feat) in enumerate(
             zip(pre_stages, post_stages)
         ):
             width = pre_feat.shape[-1]
 
-            # 1. sequential / concat branch
-            out_seq = self.seq_blocks[stage_idx](
+            # -------- CAFIM（尺度内）--------
+            out_seq = self.seq_blocks[i](
                 torch.cat([pre_feat, post_feat], dim=1)
             )
 
-            # 2. cross / interleave branch
-            mixed_cross = self.cross_blocks[stage_idx](
+            mixed_cross = self.cross_blocks[i](
                 self._interleave(pre_feat, post_feat)
             )
-            out_cross = (
-                mixed_cross[:, :, :, ::2]
-                + mixed_cross[:, :, :, 1::2]
-            )
+            out_cross = mixed_cross[:, :, :, ::2] + mixed_cross[:, :, :, 1::2]
 
-            # 3. parallel / split branch
-            mixed_par = self.par_blocks[stage_idx](
+            mixed_par = self.par_blocks[i](
                 self._split(pre_feat, post_feat)
             )
-            out_par = (
-                mixed_par[:, :, :, :width]
-                + mixed_par[:, :, :, width:]
-            )
+            out_par = mixed_par[:, :, :, :width] + mixed_par[:, :, :, width:]
 
-            current, gate_weights = self.gate_modules[stage_idx](
-                out_seq,
-                out_cross,
-                out_par,
+            current, gate_weights = self.gate_modules[i](
+                out_seq, out_cross, out_par
             )
-
-            current = self.fuse_layers[stage_idx](current)
+            current = self.fuse_layers[i](current)
 
             self.latest_gate_weights.append(gate_weights.detach())
             last_gate_weights = gate_weights
 
+            # -------- CAFIM + 多尺度交互（统一）--------
             if previous is not None:
-                current = self._upsample_add(previous, current)
-                current = self.smooth_layers[stage_idx - 1](current)
+                if self.use_ms_interaction:
+                    current = self.cafim_msi[i - 1](current, previous)
+                else:
+                    current = current + F.interpolate(
+                        previous,
+                        size=current.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                current = self.smooth_layers[i - 1](current)
 
             previous = current
 

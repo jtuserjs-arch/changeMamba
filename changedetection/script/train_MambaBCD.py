@@ -160,6 +160,8 @@ def main():
         default=0.5,
         help="Strength of uncertainty-guided pixel reweighting.",
     )
+    
+    parser.add_argument("--multi_scale_interaction", action="store_true")
     args = parser.parse_args()
 
     if args.seed is not None:

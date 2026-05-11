@@ -125,6 +125,43 @@ def main():
                     choices=["none", "cafim"])
     parser.add_argument("--interaction_stages", type=int, nargs="+", default=[2, 3])
     parser.add_argument("--interaction_reduction", type=int, default=4)
+    # Boundary refinement
+    parser.add_argument(
+        "--use_boundary",
+        action="store_true",
+        help="Enable boundary-aware refinement head.",
+    )
+
+    parser.add_argument(
+        "--boundary_weight",
+        type=float,
+        default=0.2,
+        help="Weight of boundary BCE loss.",
+    )
+
+    # Temporal symmetry consistency
+    parser.add_argument(
+        "--sym_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight of temporal symmetry consistency loss.",
+    )
+
+    # Uncertainty-guided hard pixel reweighting
+    parser.add_argument(
+        "--uncertainty_reweight",
+        action="store_true",
+        help="Use uncertainty map to reweight hard pixels.",
+    )
+
+    parser.add_argument(
+        "--uncertainty_reweight_lambda",
+        type=float,
+        default=0.5,
+        help="Strength of uncertainty-guided pixel reweighting.",
+    )
+    
+    parser.add_argument("--multi_scale_interaction", action="store_true")
     args = parser.parse_args()
 
     if args.seed is not None:

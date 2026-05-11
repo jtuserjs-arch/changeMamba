@@ -44,7 +44,7 @@ def _parse_interaction_stages(value, default=(2, 3)):
 
     return tuple(int(v) for v in value)
 
-    
+
 def _squeeze_label(labels):
     """
     Support labels in [B, H, W] or [B, 1, H, W].
@@ -145,6 +145,8 @@ def edl_digamma_loss(alpha, target, num_classes=2, ignore_index=255):
     kl = dirichlet_kl(alpha_tilde, num_classes=num_classes)
 
     return data_fit.mean() + 0.01 * kl.mean()
+
+
 def make_boundary_target(mask, ignore_index=255, kernel_size=3):
     """
     从二值变化标签生成边界标签。
@@ -251,7 +253,33 @@ def temporal_symmetry_loss(logits_forward, logits_reverse, labels, ignore_index=
         return logits_forward.sum() * 0.0
 
     return diff[valid].mean()
-    
+
+
+# ------------------------------------------------------------
+# Dice Loss (新增)
+# ------------------------------------------------------------
+def dice_loss_binary(logits, labels, ignore_index=255, eps=1e-6):
+    """
+    logits: (B, C, H, W)  二分类变化检测，C=2
+    labels: (B, H, W)      0不变, 1变化, 255忽略
+    """
+    prob = torch.softmax(logits, dim=1)[:, 1]          # [B, H, W]
+    labels = _squeeze_label(labels)
+
+    valid = labels != ignore_index
+    if valid.sum() == 0:
+        return logits.sum() * 0.0
+
+    prob = prob[valid]
+    targets = (labels[valid] == 1).float()
+
+    inter = (prob * targets).sum()
+    union = prob.sum() + targets.sum()
+
+    dice = (2.0 * inter + eps) / (union + eps)
+    return 1.0 - dice
+
+
 # ------------------------------------------------------------
 # Trainer
 # ------------------------------------------------------------
@@ -274,10 +302,13 @@ class BCDTrainer(BaseTrainer):
             use_boundary=getattr(self.args, "use_boundary", True),
             dropout_rate=getattr(self.args, "dropout_rate", 0.2),
             interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
-            interaction_stages=getattr(self.args, "interaction_stages", "2,3"),
+            interaction_stages=_parse_interaction_stages(
+                getattr(self.args, "interaction_stages", "2,3")
+            ),
             interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )
+
     def build_optimizer(self):
         base_params = []
         new_params = []
@@ -330,6 +361,7 @@ class BCDTrainer(BaseTrainer):
         uncertainty_reweight = getattr(self.args, "uncertainty_reweight", False)
         uncertainty_reweight_lambda = getattr(self.args, "uncertainty_reweight_lambda", 0.5)
         sym_loss_weight = getattr(self.args, "sym_loss_weight", 0.0)
+        dice_weight = getattr(self.args, "dice_weight", 0.0)          # 新增
 
         need_aux = use_uncertainty or use_boundary
 
@@ -380,13 +412,25 @@ class BCDTrainer(BaseTrainer):
             ignore=255,
         )
 
+        # -------------------------
+        # Dice loss (新增)
+        # -------------------------
+        dice_loss_val = None
+        if dice_weight > 0:
+            dice_loss_val = dice_loss_binary(output, labels, ignore_index=255)
+
         final_loss = ce_loss + 0.75 * lovasz_loss
+
+        if dice_loss_val is not None:
+            final_loss = final_loss + dice_weight * dice_loss_val
 
         log_items = {
             "loss": final_loss.item(),
             "ce": ce_loss.item(),
             "lovasz": lovasz_loss.item(),
         }
+        if dice_loss_val is not None:
+            log_items["dice"] = dice_loss_val.item()
 
         # -------------------------
         # Boundary loss
@@ -451,6 +495,8 @@ class BCDTrainer(BaseTrainer):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+        change_threshold = getattr(self.args, "change_threshold", 0.5)   # 新增
+
         with torch.no_grad():
             for pre_change_imgs, post_change_imgs, labels, _ in data_loader:
                 pre_change_imgs = pre_change_imgs.to(self.device).float()
@@ -458,7 +504,8 @@ class BCDTrainer(BaseTrainer):
                 labels = _squeeze_label(labels.to(self.device).long())
 
                 output = self.model(pre_change_imgs, post_change_imgs)
-                predictions = torch.argmax(output, dim=1).cpu().numpy()
+                prob = F.softmax(output, dim=1)[:, 1]                     # 取变化类概率
+                predictions = (prob > change_threshold).long().cpu().numpy()
 
                 evaluator.add_batch(labels.cpu().numpy(), predictions)
 
@@ -829,6 +876,7 @@ class BCDTrainer(BaseTrainer):
             f"{os.path.join(args.model_param_path, 'best_metrics.txt')}"
         )
 
+
 # ------------------------------------------------------------
 # Inferer
 # ------------------------------------------------------------
@@ -847,7 +895,9 @@ class BCDInferer(BaseInferer):
             use_boundary=getattr(self.args, "use_boundary", True),
             dropout_rate=getattr(self.args, "dropout_rate", 0.0),
             interaction_mode=getattr(self.args, "interaction_mode", "cafim"),
-            interaction_stages=getattr(self.args, "interaction_stages", "2,3"),
+            interaction_stages=_parse_interaction_stages(
+                getattr(self.args, "interaction_stages", "2,3")
+            ),
             interaction_reduction=getattr(self.args, "interaction_reduction", 4),
             **get_vssm_kwargs(config),
         )
@@ -1038,7 +1088,7 @@ class BCDInferer(BaseInferer):
         coords = torch.arange(kernel_size, device=device, dtype=dtype)
         coords = coords - (kernel_size - 1) / 2.0
 
-        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = torch.exp(-(torch.pow(coords, 2)) / (2 * sigma ** 2))
         g = g / g.sum()
 
         kernel_2d = g[:, None] * g[None, :]
