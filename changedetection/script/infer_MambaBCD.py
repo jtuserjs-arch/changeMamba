@@ -40,10 +40,14 @@ def main():
 
     parser.add_argument("--cuda", type=bool, default=True)
 
-    parser.add_argument("--model_type", type=str, default="MambaBCD_Tiny")
-    parser.add_argument("--result_saved_path", type=str, default="../results")
-
-    parser.add_argument("--resume", type=str)
+    # ========== 模型结构参数（与训练保持一致） ==========
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="ChangeMamba-BCD",      # 与训练默认值对齐
+        help="Model type"
+    )
+    parser.add_argument("--model_param_path", type=str, default="../saved_models")
 
     # Dynamic gate
     parser.add_argument(
@@ -54,13 +58,12 @@ def main():
         help="Dynamic gate mode. Use 'none' for original ChangeMamba decoder.",
     )
 
-    # Uncertainty
+    # Uncertainty (evidential head)
     parser.add_argument(
         "--use_uncertainty",
         action="store_true",
         help="Enable evidential uncertainty head.",
     )
-
     parser.add_argument(
         "--dropout_rate",
         type=float,
@@ -68,6 +71,68 @@ def main():
         help="Dropout rate before final classifier head.",
     )
 
+    # Boundary refinement
+    parser.add_argument(
+        "--use_boundary",
+        action="store_true",
+        help="Enable boundary-aware refinement head.",
+    )
+    parser.add_argument(
+        "--boundary_weight",
+        type=float,
+        default=0.2,
+        help="Weight of boundary BCE loss (inference not used, kept for compatibility).",
+    )
+
+    # Uncertainty-guided hard pixel reweighting
+    parser.add_argument(
+        "--uncertainty_reweight",
+        action="store_true",
+        help="Use uncertainty map to reweight hard pixels.",
+    )
+    parser.add_argument(
+        "--uncertainty_reweight_lambda",
+        type=float,
+        default=0.5,
+        help="Strength of uncertainty-guided pixel reweighting.",
+    )
+
+    # Temporal symmetry consistency (loss weight, kept for compatibility)
+    parser.add_argument(
+        "--sym_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight of temporal symmetry consistency loss.",
+    )
+
+    # Multi-scale interaction (CAFIM)
+    parser.add_argument(
+        "--interaction_mode",
+        type=str,
+        default="cafim",
+        choices=["none", "cafim"]
+    )
+    parser.add_argument(
+        "--interaction_stages",
+        type=int,
+        nargs="+",
+        default=[2, 3]
+    )
+    parser.add_argument(
+        "--interaction_reduction",
+        type=int,
+        default=4
+    )
+    parser.add_argument(
+        "--multi_scale_interaction",
+        action="store_true"
+    )
+
+    # ========== 推理特有参数 ==========
+    parser.add_argument("--result_saved_path", type=str, default="../results")
+    parser.add_argument("--resume", type=str, help="Path to checkpoint (alternative to pretrained_weight_path)")
+
+    # MC Dropout sampling
     parser.add_argument(
         "--mc_samples",
         type=int,
@@ -75,12 +140,12 @@ def main():
         help="MC Dropout sampling times. 0 means normal inference.",
     )
 
+    # Output saving options
     parser.add_argument(
         "--save_uncertainty",
         action="store_true",
         help="Save uncertainty maps.",
     )
-
     parser.add_argument(
         "--save_gate_weights",
         action="store_true",
@@ -98,6 +163,7 @@ def main():
         help="Threshold for changed-class probability.",
     )
 
+    # Robustness evaluation perturbations
     parser.add_argument(
         "--perturb_type",
         type=str,
@@ -105,39 +171,25 @@ def main():
         choices=["none", "noise", "blur", "shift"],
         help="Perturbation type for robustness evaluation.",
     )
-
     parser.add_argument(
         "--noise_std",
         type=float,
         default=0.03,
         help="Gaussian noise standard deviation.",
     )
-
     parser.add_argument(
         "--blur_kernel",
         type=int,
         default=5,
         help="Gaussian blur kernel size.",
     )
-
     parser.add_argument(
         "--shift_pixels",
         type=int,
         default=4,
         help="Shift pixels for misregistration robustness test.",
     )
-    parser.add_argument("--interaction_mode", type=str, default="cafim",
-                        choices=["none", "cafim"])
-    parser.add_argument("--interaction_stages", type=int, nargs="+", default=[2, 3])
-    parser.add_argument("--interaction_reduction", type=int, default=4)
-    
-    # Boundary refinement
-    parser.add_argument(
-        "--use_boundary",
-        action="store_true",
-        help="Enable boundary-aware refinement head.",
-    )
-    parser.add_argument("--multi_scale_interaction", action="store_true")
+
     args = parser.parse_args()
 
     populate_name_lists(
